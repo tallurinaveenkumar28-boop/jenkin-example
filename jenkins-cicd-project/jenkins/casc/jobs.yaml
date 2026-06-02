@@ -1,0 +1,96 @@
+jobs:
+  - script: |
+      folder('SpringBoot-App') {
+        description('Spring Boot application pipelines')
+        displayName('Spring Boot App')
+      }
+
+      pipelineJob('SpringBoot-App/CI-Build') {
+        description('Build, test, and package the Spring Boot application')
+        definition {
+          cpsScmFlowDefinition {
+            scm {
+              git {
+                remote {
+                  url('${APP_REPO_URL:-https://github.com/your-org/your-repo.git}')
+                  credentials('github-credentials')
+                }
+                branch('*/main')
+              }
+            }
+            scriptPath('pipelines/springboot-app/Jenkinsfile.build')
+            lightweight(true)
+          }
+        }
+        triggers {
+          githubPush()
+        }
+      }
+
+      pipelineJob('SpringBoot-App/CD-Deploy') {
+        description('Deploy the Spring Boot app to EKS')
+        parameters {
+          stringParam('IMAGE_TAG', 'latest', 'Docker image tag to deploy')
+          choiceParam('ENVIRONMENT', ['dev', 'staging', 'prod'], 'Target environment')
+        }
+        definition {
+          cpsScmFlowDefinition {
+            scm {
+              git {
+                remote {
+                  url('${APP_REPO_URL:-https://github.com/your-org/your-repo.git}')
+                  credentials('github-credentials')
+                }
+                branch('*/main')
+              }
+            }
+            scriptPath('pipelines/springboot-app/Jenkinsfile.deploy')
+            lightweight(true)
+          }
+        }
+      }
+
+      pipelineJob('SpringBoot-App/Full-Pipeline') {
+        description('End-to-end CI/CD: build → test → push → deploy')
+        definition {
+          cpsScmFlowDefinition {
+            scm {
+              git {
+                remote {
+                  url('${APP_REPO_URL:-https://github.com/your-org/your-repo.git}')
+                  credentials('github-credentials')
+                }
+                branch('*/main')
+              }
+            }
+            scriptPath('Jenkinsfile')
+            lightweight(true)
+          }
+        }
+        triggers {
+          githubPush()
+        }
+      }
+
+      folder('Infrastructure') {
+        description('Infrastructure provisioning pipelines')
+      }
+
+      pipelineJob('Infrastructure/Terraform-Plan') {
+        description('Plan Terraform EKS changes')
+        definition {
+          cpsScmFlowDefinition {
+            scm {
+              git {
+                remote {
+                  url('${APP_REPO_URL:-https://github.com/your-org/your-repo.git}')
+                  credentials('github-credentials')
+                }
+                branch('*/main')
+              }
+            }
+            scriptPath('pipelines/infra/Jenkinsfile.terraform')
+            lightweight(true)
+          }
+        }
+      }

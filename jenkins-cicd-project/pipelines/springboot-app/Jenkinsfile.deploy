@@ -1,0 +1,162 @@
+#!/usr/bin/env groovy
+// ── CD Deploy Pipeline ────────────────────────────────────
+
+@Library('shared-library') _
+
+pipeline {
+    agent {
+        kubernetes {
+            label 'helm-agent'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: helm
+      image: alpine/helm:3.14.0
+      command: [sleep]
+      args: [99d]
+    - name: awscli
+      image: amazon/aws-cli:latest
+      command: [sleep]
+      args: [99d]
+'''
+        }
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    parameters {
+        string(name: 'IMAGE_TAG',    defaultValue: 'latest', description: 'Docker image tag to deploy')
+        string(name: 'AWS_ACCOUNT_ID', defaultValue: '', description: 'AWS Account ID')
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'prod'], description: 'Target environment')
+    }
+
+    environment {
+        APP_NAME     = 'springboot-app'
+        AWS_REGION   = 'us-east-1'
+        ECR_REGISTRY = "${params.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO     = "${ECR_REGISTRY}/${APP_NAME}"
+        EKS_CLUSTER  = 'springboot-eks-cluster'
+        NAMESPACE    = 'default'
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!params.AWS_ACCOUNT_ID) {
+                        error("AWS_ACCOUNT_ID parameter is required")
+                    }
+                    if (!params.IMAGE_TAG) {
+                        error("IMAGE_TAG parameter is required")
+                    }
+                    echo "Deploying ${ECR_REPO}:${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+                }
+            }
+        }
+
+        stage('Configure kubectl') {
+            steps {
+                container('awscli') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                      credentialsId: 'aws-credentials']]) {
+                        sh """
+                            aws eks update-kubeconfig \
+                                --region ${AWS_REGION} \
+                                --name ${EKS_CLUSTER}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Helm Diff') {
+            steps {
+                container('helm') {
+                    sh """
+                        helm diff upgrade ${APP_NAME} ./helm/springboot-app \
+                            --namespace ${NAMESPACE} \
+                            --set image.repository=${ECR_REPO} \
+                            --set image.tag=${params.IMAGE_TAG} \
+                            --set environment=${params.ENVIRONMENT} || true
+                    """
+                }
+            }
+        }
+
+        stage('Production Approval') {
+            when { expression { params.ENVIRONMENT == 'prod' } }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Approve deployment of tag [${params.IMAGE_TAG}] to PRODUCTION?",
+                          ok: 'Approve & Deploy',
+                          submitter: 'admin'
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                container('helm') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                      credentialsId: 'aws-credentials']]) {
+                        sh """
+                            helm upgrade --install ${APP_NAME} ./helm/springboot-app \
+                                --namespace ${NAMESPACE} \
+                                --set image.repository=${ECR_REPO} \
+                                --set image.tag=${params.IMAGE_TAG} \
+                                --set environment=${params.ENVIRONMENT} \
+                                --wait --timeout 5m \
+                                --atomic
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Verify Rollout') {
+            steps {
+                container('awscli') {
+                    sh """
+                        kubectl rollout status deployment/${APP_NAME} \
+                            -n ${NAMESPACE} --timeout=3m
+                        kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}
+                    """
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                sh """
+                    sleep 10
+                    SVC_IP=\$(kubectl get svc ${APP_NAME} -n ${NAMESPACE} \
+                        -o jsonpath='{.spec.clusterIP}')
+                    curl -sf http://\$SVC_IP/api/health && echo "Health check passed"
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(color: 'good',
+                message: ":rocket: Deploy SUCCESS — `${APP_NAME}:${params.IMAGE_TAG}` → *${params.ENVIRONMENT}*")
+        }
+        failure {
+            slackSend(color: 'danger',
+                message: ":x: Deploy FAILED — `${APP_NAME}:${params.IMAGE_TAG}` → *${params.ENVIRONMENT}*")
+            container('helm') {
+                sh "helm rollback ${APP_NAME} -n ${NAMESPACE} || true"
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

@@ -1,0 +1,121 @@
+#!/usr/bin/env groovy
+// ── Terraform Infrastructure Pipeline ────────────────────
+
+pipeline {
+    agent {
+        docker {
+            image 'hashicorp/terraform:1.7'
+            args  '-v /var/run/docker.sock:/var/run/docker.sock --entrypoint=""'
+        }
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        lock(resource: 'terraform-eks-state')
+    }
+
+    parameters {
+        choice(name: 'ACTION',      choices: ['plan', 'apply', 'destroy'], description: 'Terraform action')
+        string(name: 'AWS_REGION',  defaultValue: 'us-east-1', description: 'AWS Region')
+        booleanParam(name: 'AUTO_APPROVE', defaultValue: false, description: 'Auto-approve apply/destroy')
+    }
+
+    environment {
+        TF_DIR     = 'terraform'
+        TF_IN_AUTOMATION = 'true'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    dir(TF_DIR) {
+                        sh 'terraform init -input=false'
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                dir(TF_DIR) {
+                    sh 'terraform validate'
+                    sh 'terraform fmt -check'
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    dir(TF_DIR) {
+                        sh "terraform plan -out=tfplan -input=false -var='aws_region=${params.AWS_REGION}'"
+                        sh 'terraform show -no-color tfplan > tfplan.txt'
+                        archiveArtifacts artifacts: 'tfplan.txt'
+                    }
+                }
+            }
+        }
+
+        stage('Approval') {
+            when {
+                allOf {
+                    expression { params.ACTION in ['apply', 'destroy'] }
+                    expression { !params.AUTO_APPROVE }
+                }
+            }
+            steps {
+                script {
+                    def planText = readFile("${TF_DIR}/tfplan.txt")
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input message: "Review plan and approve Terraform ${params.ACTION}?",
+                              ok: 'Approve',
+                              submitter: 'admin'
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            when { expression { params.ACTION == 'apply' } }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    dir(TF_DIR) {
+                        sh 'terraform apply -input=false tfplan'
+                        sh 'terraform output -json > tf-outputs.json'
+                        archiveArtifacts artifacts: 'tf-outputs.json'
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Destroy') {
+            when { expression { params.ACTION == 'destroy' } }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    dir(TF_DIR) {
+                        sh "terraform destroy -auto-approve -input=false -var='aws_region=${params.AWS_REGION}'"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always { cleanWs() }
+        failure {
+            slackSend(color: 'danger',
+                message: ":x: Terraform *${params.ACTION}* FAILED on `${env.JOB_NAME}` — <${env.BUILD_URL}|View>")
+        }
+    }
+}

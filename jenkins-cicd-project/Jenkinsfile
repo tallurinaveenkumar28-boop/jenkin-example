@@ -1,0 +1,291 @@
+#!/usr/bin/env groovy
+// ============================================================
+// Full CI/CD Pipeline — Spring Boot → Docker → EKS (via Helm)
+// ============================================================
+
+@Library('shared-library') _
+
+pipeline {
+    agent {
+        kubernetes {
+            label 'maven-docker'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: maven
+      image: maven:3.9.6-eclipse-temurin-17
+      command: [sleep]
+      args: [99d]
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true
+      env:
+        - name: DOCKER_TLS_CERTDIR
+          value: ""
+    - name: helm
+      image: alpine/helm:3.14.0
+      command: [sleep]
+      args: [99d]
+'''
+        }
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        APP_NAME        = 'springboot-app'
+        AWS_REGION      = 'us-east-1'
+        ECR_REGISTRY    = "${params.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO        = "${ECR_REGISTRY}/${APP_NAME}"
+        IMAGE_TAG       = "${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+        EKS_CLUSTER     = 'springboot-eks-cluster'
+        HELM_CHART_PATH = './helm/springboot-app'
+        K8S_NAMESPACE   = 'default'
+    }
+
+    parameters {
+        string(name: 'AWS_ACCOUNT_ID',  defaultValue: '', description: 'AWS Account ID')
+        choice(name: 'DEPLOY_ENV',      choices: ['dev', 'staging', 'prod'], description: 'Target environment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip unit tests')
+        booleanParam(name: 'DRY_RUN',   defaultValue: false, description: 'Helm dry-run only')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+                    env.GIT_AUTHOR    = sh(script: 'git log -1 --pretty=%an', returnStdout: true).trim()
+                }
+                notifySlack('STARTED', "#439FE0")
+            }
+        }
+
+        stage('Build') {
+            steps {
+                container('maven') {
+                    sh 'mvn clean compile -B'
+                }
+            }
+        }
+
+        stage('Test') {
+            when { expression { !params.SKIP_TESTS } }
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        container('maven') {
+                            sh 'mvn test -B'
+                        }
+                    }
+                    post {
+                        always {
+                            junit '**/target/surefire-reports/*.xml'
+                        }
+                    }
+                }
+                stage('Code Coverage') {
+                    steps {
+                        container('maven') {
+                            sh 'mvn verify -B'
+                        }
+                    }
+                    post {
+                        always {
+                            jacoco(
+                                execPattern: '**/target/jacoco.exec',
+                                classPattern: '**/target/classes',
+                                sourcePattern: '**/src/main/java'
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Package') {
+            steps {
+                container('maven') {
+                    sh 'mvn package -DskipTests -B'
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                }
+            }
+        }
+
+        stage('Docker Build & Push') {
+            when { branch 'main' }
+            steps {
+                container('docker') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                      credentialsId: 'aws-credentials']]) {
+                        sh """
+                            aws ecr get-login-password --region ${AWS_REGION} | \
+                            docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                            docker build -t ${ECR_REPO}:${IMAGE_TAG} .
+                            docker tag  ${ECR_REPO}:${IMAGE_TAG} ${ECR_REPO}:latest
+                            docker push ${ECR_REPO}:${IMAGE_TAG}
+                            docker push ${ECR_REPO}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            when { branch 'main' }
+            steps {
+                container('docker') {
+                    sh """
+                        docker run --rm \
+                          -v /var/run/docker.sock:/var/run/docker.sock \
+                          aquasec/trivy:latest image \
+                          --exit-code 0 \
+                          --severity HIGH,CRITICAL \
+                          --format table \
+                          ${ECR_REPO}:${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Dev') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENV == 'dev' || params.DEPLOY_ENV == 'staging' || params.DEPLOY_ENV == 'prod' }
+                }
+            }
+            steps {
+                deployToEks('dev')
+            }
+        }
+
+        stage('Integration Tests') {
+            when { branch 'main' }
+            steps {
+                container('maven') {
+                    sh 'mvn verify -Pintegration-tests -B || true'
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENV == 'staging' || params.DEPLOY_ENV == 'prod' }
+                }
+            }
+            steps {
+                deployToEks('staging')
+            }
+        }
+
+        stage('Approval — Production') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENV == 'prod' }
+                }
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Deploy ${IMAGE_TAG} to PRODUCTION?",
+                          ok: 'Deploy',
+                          submitter: 'admin'
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENV == 'prod' }
+                }
+            }
+            steps {
+                deployToEks('prod')
+            }
+        }
+
+        stage('Smoke Test') {
+            when { branch 'main' }
+            steps {
+                container('maven') {
+                    sh """
+                        sleep 15
+                        curl -sf http://springboot-app/api/health || exit 1
+                        echo "Smoke test passed"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            notifySlack('SUCCESS', 'good')
+        }
+        failure {
+            notifySlack('FAILURE', 'danger')
+        }
+        unstable {
+            notifySlack('UNSTABLE', 'warning')
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// ── Helpers ────────────────────────────────────────────────
+def deployToEks(String env) {
+    container('helm') {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                          credentialsId: 'aws-credentials']]) {
+            sh """
+                aws eks update-kubeconfig \
+                    --region ${AWS_REGION} \
+                    --name ${EKS_CLUSTER}
+
+                helm upgrade --install ${APP_NAME} ${HELM_CHART_PATH} \
+                    --namespace ${K8S_NAMESPACE} \
+                    --set image.repository=${ECR_REPO} \
+                    --set image.tag=${IMAGE_TAG} \
+                    --set environment=${env} \
+                    ${params.DRY_RUN ? '--dry-run' : ''} \
+                    --wait --timeout 5m
+
+                kubectl rollout status deployment/${APP_NAME} \
+                    -n ${K8S_NAMESPACE} --timeout=3m
+            """
+        }
+    }
+}
+
+def notifySlack(String status, String color) {
+    slackSend(
+        color: color,
+        message: """*${status}* — `${env.JOB_NAME}` #${env.BUILD_NUMBER}
+Branch: `${env.BRANCH_NAME}` | Commit: `${env.GIT_COMMIT?.take(7)}`
+Author: ${env.GIT_AUTHOR} | Env: `${params.DEPLOY_ENV}`
+<${env.BUILD_URL}|View Build>"""
+    )
+}
