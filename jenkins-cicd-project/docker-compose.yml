@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  jenkins:
+    build:
+      context: ./jenkins
+      dockerfile: Dockerfile
+    container_name: jenkins
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./jenkins/casc:/var/jenkins_home/casc_configs
+      - ./shared-library:/var/jenkins_home/shared-library
+    environment:
+      - CASC_JENKINS_CONFIG=/var/jenkins_home/casc_configs
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false
+    networks:
+      - jenkins-net
+
+  jenkins-agent:
+    image: jenkins/ssh-agent:jdk17
+    container_name: jenkins-agent
+    restart: unless-stopped
+    environment:
+      - JENKINS_AGENT_SSH_PUBKEY=${JENKINS_AGENT_SSH_PUBKEY}
+    networks:
+      - jenkins-net
+
+volumes:
+  jenkins_home:
+
+networks:
+  jenkins-net:
+    driver: bridge

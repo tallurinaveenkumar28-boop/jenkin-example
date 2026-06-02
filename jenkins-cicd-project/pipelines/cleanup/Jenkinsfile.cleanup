@@ -1,0 +1,76 @@
+#!/usr/bin/env groovy
+// ── Cleanup Pipeline — prune old Docker images & workspaces ─
+
+pipeline {
+    agent any
+
+    triggers {
+        cron('H 2 * * 0')  // Every Sunday at 2am
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        timestamps()
+    }
+
+    parameters {
+        string(name: 'KEEP_IMAGES', defaultValue: '10', description: 'Number of ECR image tags to keep')
+        string(name: 'AWS_ACCOUNT_ID', defaultValue: '', description: 'AWS Account ID')
+    }
+
+    environment {
+        AWS_REGION   = 'us-east-1'
+        ECR_REGISTRY = "${params.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        APP_NAME     = 'springboot-app'
+    }
+
+    stages {
+        stage('Prune Docker') {
+            steps {
+                sh 'docker system prune -af --filter "until=72h" || true'
+            }
+        }
+
+        stage('Prune Old ECR Images') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh """
+                        IMAGES=\$(aws ecr describe-images \
+                            --repository-name ${APP_NAME} \
+                            --region ${AWS_REGION} \
+                            --query 'sort_by(imageDetails,&imagePushedAt)[*].imageDigest' \
+                            --output text)
+
+                        COUNT=\$(echo "\$IMAGES" | wc -w)
+                        DELETE_COUNT=\$((\$COUNT - ${params.KEEP_IMAGES}))
+
+                        if [ "\$DELETE_COUNT" -gt 0 ]; then
+                            TO_DELETE=\$(echo "\$IMAGES" | tr ' ' '\n' | head -n \$DELETE_COUNT)
+                            for digest in \$TO_DELETE; do
+                                aws ecr batch-delete-image \
+                                    --repository-name ${APP_NAME} \
+                                    --region ${AWS_REGION} \
+                                    --image-ids imageDigest=\$digest
+                            done
+                            echo "Deleted \$DELETE_COUNT old images."
+                        else
+                            echo "No images to prune."
+                        fi
+                    """
+                }
+            }
+        }
+
+        stage('Clean Jenkins Workspaces') {
+            steps {
+                sh 'find /var/jenkins_home/workspace -maxdepth 1 -mtime +7 -type d -exec rm -rf {} + || true'
+                echo "Old workspaces cleaned."
+            }
+        }
+    }
+
+    post {
+        always { cleanWs() }
+    }
+}

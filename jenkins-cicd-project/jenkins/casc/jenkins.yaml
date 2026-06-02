@@ -1,0 +1,116 @@
+jenkins:
+  systemMessage: "Jenkins CI/CD Server — Managed via Configuration as Code"
+  numExecutors: 0
+  mode: EXCLUSIVE
+  scmCheckoutRetryCount: 2
+
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "admin"
+          password: "${JENKINS_ADMIN_PASSWORD:-admin123}"
+          properties:
+            - mailer:
+                emailAddress: "admin@example.com"
+
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: "admin"
+            description: "Full access"
+            permissions:
+              - "Overall/Administer"
+            entries:
+              - user: "admin"
+          - name: "developer"
+            description: "Build and view"
+            permissions:
+              - "Overall/Read"
+              - "Job/Build"
+              - "Job/Read"
+              - "Job/Workspace"
+            entries:
+              - group: "developers"
+
+  clouds:
+    - kubernetes:
+        name: "kubernetes"
+        serverUrl: "${K8S_API_URL:-https://kubernetes.default.svc}"
+        namespace: "jenkins"
+        jenkinsUrl: "http://jenkins:8080"
+        jenkinsTunnel: "jenkins:50000"
+        connectTimeout: 5
+        readTimeout: 15
+        containerCapStr: 20
+        podTemplates:
+          - name: "maven-agent"
+            namespace: "jenkins"
+            label: "maven"
+            containers:
+              - name: "maven"
+                image: "maven:3.9.6-eclipse-temurin-17"
+                command: "sleep"
+                args: "99d"
+                resourceRequestCpu: "500m"
+                resourceRequestMemory: "512Mi"
+                resourceLimitCpu: "1000m"
+                resourceLimitMemory: "1Gi"
+          - name: "docker-agent"
+            namespace: "jenkins"
+            label: "docker"
+            containers:
+              - name: "docker"
+                image: "docker:24-dind"
+                command: "sleep"
+                args: "99d"
+                privileged: true
+
+unclassified:
+  location:
+    url: "${JENKINS_URL:-http://localhost:8080}/"
+    adminAddress: "admin@example.com"
+
+  slackNotifier:
+    teamDomain: "${SLACK_TEAM_DOMAIN:-yourteam}"
+    tokenCredentialId: "slack-token"
+    room: "#ci-cd"
+
+  globalLibraries:
+    libraries:
+      - name: "shared-library"
+        defaultVersion: "main"
+        allowVersionOverride: true
+        retriever:
+          modernSCM:
+            scm:
+              git:
+                remote: "${SHARED_LIB_REPO:-file:///var/jenkins_home/shared-library}"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - aws:
+              scope: GLOBAL
+              id: "aws-credentials"
+              description: "AWS credentials for ECR and EKS"
+              accessKey: "${AWS_ACCESS_KEY_ID}"
+              secretKey: "${AWS_SECRET_ACCESS_KEY}"
+          - string:
+              scope: GLOBAL
+              id: "slack-token"
+              description: "Slack bot token"
+              secret: "${SLACK_TOKEN}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "docker-hub-credentials"
+              description: "Docker Hub credentials"
+              username: "${DOCKER_HUB_USER}"
+              password: "${DOCKER_HUB_TOKEN}"
+          - string:
+              scope: GLOBAL
+              id: "sonar-token"
+              description: "SonarQube token"
+              secret: "${SONAR_TOKEN}"
